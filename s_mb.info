@@ -1,0 +1,11 @@
+name = Shilo Moneybird
+core = 7.x
+package = Shilo
+version = 7.x-1.0-beta1
+project = s_mb
+dependencies[] = features
+dependencies[] = number
+features[features_api][] = api:2
+features[field_base][] = field_mb_id
+features[field_instance][] = user-user-field_mb_id
+project path = sites/all/modules/features

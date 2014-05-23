@@ -1,0 +1,345 @@
+<?php
+/**
+ * @file
+ * Moneybird API.
+ */
+
+/**
+ * Implements hook_init().
+ */
+function s_mb_init() {
+  require(libraries_get_path('moneybird_php_api') . '/ApiConnector.php');
+  spl_autoload_register('Moneybird\ApiConnector::autoload');
+}
+
+/**
+ * Implements hook_menu().
+ */
+function s_mb_menu() {
+  $items['admin/content/clients'] = array(
+    'title' => 'Moneybird Clients',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('s_mb_clients_form'),
+    'access arguments' => array('manage moneybird'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['user/%user/facturen'] = array(
+    'title' => 'Mijn facturen',
+    'page callback' => 's_mb_my_invoices',
+    'page arguments' => array(1),
+    'access arguments' => array('access moneybird'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Returns users invoices from moneybird.
+ */
+function s_mb_my_invoices($account) {
+  $clients = node_load_multiple(array(), array(
+    'uid' => $account->uid,
+    'type' => 's_client'
+  ));
+
+  drupal_set_title('Mijn facturen');
+
+  foreach ($clients as $nid => $client) {
+    $client_mb_id = $client->field_s_mb_id[LANGUAGE_NONE][0]['value'];
+    $invoices = s_mb_get_invoices($client_mb_id);
+
+    $link_target = array('attributes' => array('target' => '_blank'));
+
+    foreach ($invoices as $invoice) {
+      $rows[$client_mb_id][] = array(
+        array('data' => l($invoice['id'], $invoice['url'], $link_target), 'class' => 'invoice'),
+        array('data' => date('d-m-Y', $invoice['date']), 'class' => 'date'),
+        array('data' => $invoice['state'], 'class' => 'client'),
+        array('data' => '€ ' . number_format($invoice['price'], 2, ',', '.'), 'class' => 'price'),
+        array('data' => l($invoice['state'], $invoice['url'], $link_target), 'class' => 'status'),
+      );
+    }
+
+    $render_array[$client_mb_id] = array(
+      '#theme' => 'table',
+      '#header' => array('Factuur', 'Factuurdatum', 'Client', 'Bedrag', 'Status'),
+      '#caption' => $client->title,
+      '#rows' => $rows[$client_mb_id],
+    );
+  }
+
+  return $render_array;
+}
+
+/**
+ * Get invoices from moneybird.
+ */
+function s_mb_get_invoices($account_id) {
+  $mb_invoices = &drupal_static(__FUNCTION__);
+
+  if (!isset($mb_invoices[$account_id])) {
+    if ($cache = cache_get('mb_invoices_' . $account_id)) {
+      $mb_invoices[$account_id] = $cache->data;
+    }
+    else {
+
+      $connector = s_mb_get_mb();
+
+      $contactService = $connector->getService('Contact');
+      $invoiceService = $connector->getService('Invoice');
+
+      $contact = $contactService->getByCustomerId($account_id);
+
+      $invoices = $contact->getInvoices($invoiceService);
+
+      $customer_invoices = array();
+
+      foreach ($invoices as $invoice) {
+        $date = (array) $invoice->createdAt;
+
+        $customer_invoices[$invoice->invoiceId] = array(
+          'id' => $invoice->invoiceId,
+          'date' => strtotime($date['date']),
+          'state' => $invoice->state,
+          'price' => (int) $invoice->totalPriceExclTax,
+          'url' => $invoice->url
+        );
+      }
+
+      $mb_invoices[$account_id] = $customer_invoices;
+
+      cache_set('mb_invoices_' . $account_id, $mb_invoices[$account_id], 'cache');
+    }
+  }
+
+  asort($mb_invoices[$account_id]);
+  $mb_invoices[$account_id] = array_reverse($mb_invoices[$account_id]);
+
+  return $mb_invoices[$account_id];
+}
+
+
+/**
+ * Loads a client node by moneybird ID.
+ */
+function s_mb_load_client_by_id($mb_id) {
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 's_client')
+    ->propertyCondition('status', 1)
+    ->fieldCondition('field_s_mb_id', 'value', $mb_id, '=')
+    ->range(0, 10)
+    ->addMetaData('account', user_load(1)); // Run the query as user 1.
+  $result = $query->execute();
+
+  if (isset($result['node'])) {
+    $client_nids = array_keys($result['node']);
+    $client_nodes = entity_load('node', $client_nids);
+
+    return end($client_nodes);
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function s_mb_permission() {
+  return array(
+    'manage moneybird' =>  array(
+      'title' => t('manage moneybird'),
+      'description' => t('manage moneybird'),
+    ),
+
+    'access moneybird' =>  array(
+      'title' => t('access moneybird'),
+      'description' => t('access moneybird'),
+    ),
+  );
+}
+
+function s_mb_clients_form() {
+  $form = array();
+
+  $mb_contacts = s_mb_get_contacts();
+
+  $options = array();
+
+  foreach ($mb_contacts as $id => $mb_contact) {
+    $options[$id] = $mb_contact['name'];
+  }
+
+  $form['accounts'] = array(
+    '#title' => 'Actieve accounts',
+    '#options' => $options,
+    '#type' => 'checkboxes'
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => 'Maak accounts en verstuur inlog email indien nodig.'
+  );
+
+  return $form;
+}
+
+function s_mb_clients_form_submit(&$form, &$form_state) {
+  $accounts_to_batch = array();
+  foreach($form_state['values']['accounts'] as $mb_account_id) {
+    if ($mb_account_id) {
+      $accounts_to_batch[] = $mb_account_id;
+    }
+  }
+
+  if (count($accounts_to_batch)) {
+    batch_set(s_mb_clients_batch_create($accounts_to_batch));
+  }
+}
+
+/**
+* Batch operation: create a drupal account and a client node for each ID.
+*/
+function s_mb_clients_batch_create($accounts_to_batch) {
+  // build the list of operation functions and function arguments
+  foreach($accounts_to_batch as $account_to_batch) {
+    // $operations[] = array(<function name>, <array of arguments to pass to function>);
+    $operations[] = array('s_mb_clients_batch_create_runner', array($account_to_batch));
+  }
+
+  // build the batch instructions
+  $batch = array(
+    'operations' => $operations,
+    'finished' => 's_mb_clients_batch_create_finished',
+  );
+  return $batch;
+}
+
+/**
+* Batch operation: create a drupal account and a client node for each ID.
+* This is the function that is called on each operation in the above.
+*/
+function s_mb_clients_batch_create_runner($account_to_batch, &$context) {
+  $context['results'][] = $account_to_batch;
+  // Optional message displayed under the progressbar.
+  $context['message'] = t('Processing account "@title"', array('@title' => $account_to_batch));
+  $updated = FALSE;
+
+  $mb_account = s_mb_get_contacts($account_to_batch);
+
+  $account = user_load_by_mail($mb_account['mail']);
+
+  if (!$account->uid) {
+    //This will generate a random password, you could set your own here
+    $password = user_password(8);
+
+    //set up the user fields
+    $fields = array(
+      'name' => $mb_account['mail'],
+      'mail' => $mb_account['mail'],
+      'pass' => $password,
+      'status' => 1,
+      'init' => 'email address',
+      'roles' => array(
+        DRUPAL_AUTHENTICATED_RID => 'authenticated user',
+      ),
+    );
+
+    drupal_set_message(t('Created account: !account', array('!account' => $mb_account['mail'])), 'status');
+
+    //the first parameter is left blank so a new user is created
+    $account = user_save('', $fields);
+  }
+
+  $client = s_mb_load_client_by_id($mb_account['id']);
+
+  if(!isset($client->nid)) {
+    $client = new stdClass();
+    $client->title = $mb_account['name'];
+    $client->type = 's_client';
+    node_object_prepare($client);
+    $client->language = LANGUAGE_NONE;
+    $client->uid = $account->uid;
+    $client->field_s_mb_id[LANGUAGE_NONE][0]['value'] = $mb_account['id'];
+    $client->status = 1;
+    $client->promote = 0;
+
+    drupal_set_message(t('Created client: !client', array('!client' => $mb_account['name'])), 'status');
+
+    node_save($client);
+  }
+}
+
+function s_mb_clients_batch_create_finished($success, $results, $operations) {
+  if ($success) {
+    drupal_set_message(t('@count accounts  processed.', array('@count' => count($results))));
+  } else {
+    // An error occurred.
+    // $operations contains the operations that remained unprocessed.
+    $error_operation = reset($operations);
+    drupal_set_message(t('An error occurred while processing @operation with arguments : @args', array('@operation' => $error_operation[0], '@args' => print_r($error_operation[0], TRUE))));
+  }
+}
+
+/**
+ * Get accounts from moneybird.
+ */
+function s_mb_get_contacts($account_id = NULL) {
+  $mb_contacts = &drupal_static(__FUNCTION__);
+
+  if (!isset($mb_contacts)) {
+    if ($cache = cache_get('mb_contacts')) {
+      $mb_contacts = $cache->data;
+    }
+    else {
+
+      $connector = s_mb_get_mb();
+
+      $contactService = $connector->getService('Contact');
+
+      $contacts = $contactService->getAll();
+
+      foreach ($contacts as $contact) {
+        $mb_contacts[$contact->customerId] = array(
+          'name' => $contact->chamberOfCommerce,
+          'mail' => $contact->email,
+          'id' => $contact->customerId
+        );
+      }
+
+      cache_set('mb_contacts', $mb_contacts, 'cache');
+    }
+  }
+
+  if (isset($account_id)) {
+    return $mb_contacts[$account_id];
+  }
+  else {
+    return $mb_contacts;
+  }
+}
+
+/**
+ * Returns the moneybird connector.
+ */
+function s_mb_get_mb() {
+  $config = array(
+      'clientname' => 'shilo', // see Moneybird URL: yourclientname.moneybird.nl
+      'emailaddress' => 'info@shilo.nl', // You set this when creating the account
+      'password' => 'loveyougod', // The password you set in Moneybird when you confirmed the e-mail address
+  );
+
+  // Create a Transport
+  $transport = new Moneybird\HttpClient();
+  $transport->setAuth(
+    $config['emailaddress'],
+    $config['password']
+  );
+  $connector = new Moneybird\ApiConnector(
+    $config['clientname'],
+    $transport,
+    new Moneybird\XmlMapper() // create a mapper
+  );
+
+  return $connector;
+}
